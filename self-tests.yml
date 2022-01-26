@@ -155,7 +155,7 @@ functions:
       local_file: dist-test.tar.gz
   run-cross:
     command: shell.exec
-    param:
+    s
       script: |
         set -o xtrace
         set -o errexit
