@@ -2501,17 +2501,19 @@ func (t *Task) Insert() error {
 // are also archived.
 func (t *Task) Archive() error {
 	archiveTask := t.makeArchivedTask()
-	err := db.Insert(OldCollection, archiveTask)
-	if err != nil {
-		grip.Error(message.WrapError(err, message.Fields{
-			"archive_task_id": archiveTask.Id,
-			"old_task_id":     archiveTask.OldTaskId,
-			"execution":       t.Execution,
-			"display_only":    t.DisplayOnly,
-		}))
-		return errors.Wrap(err, "inserting archived task into old tasks")
+	if utility.StringSliceContains(evergreen.TaskCompletedStatuses, archiveTask.Status) {
+		err := db.Insert(OldCollection, archiveTask)
+		if err != nil {
+			grip.Error(message.WrapError(err, message.Fields{
+				"archive_task_id": archiveTask.Id,
+				"old_task_id":     archiveTask.OldTaskId,
+				"execution":       t.Execution,
+				"display_only":    t.DisplayOnly,
+			}))
+			return errors.Wrap(err, "inserting archived task into old tasks")
+		}
 	}
-	err = UpdateOne(
+	err := UpdateOne(
 		bson.M{
 			IdKey:     t.Id,
 			StatusKey: bson.M{"$in": evergreen.TaskCompletedStatuses},
@@ -2574,7 +2576,10 @@ func ArchiveMany(tasks []Task) error {
 	archived := []interface{}{}
 	taskIds := []string{}
 	for _, t := range tasks {
-		archived = append(archived, *t.makeArchivedTask())
+		archivedTask := *t.makeArchivedTask()
+		if utility.StringSliceContains(evergreen.TaskCompletedStatuses, archivedTask.Status) {
+			archived = append(archived, archivedTask)
+		}
 		taskIds = append(taskIds, t.Id)
 	}
 	grip.DebugWhen(len(utility.UniqueStrings(taskIds)) != len(taskIds), message.Fields{
