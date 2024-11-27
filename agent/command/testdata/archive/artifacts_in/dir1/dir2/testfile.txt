@@ -1,1 +1,47 @@
-test
+PR 1
+### Description
+
+### Problem
+When the front of a task queue is comprised entirely of task group tasks, a failure mode can occur where the next task operation continuously fetches a task group task, sees that it is not ready to be dispatched, and skips it to move onto the next task group task. This can go on for a long time, resulting in really large latency for the operation such as in [this example](https://ui.honeycomb.io/my_dashboard).
+
+### Cause
+[This function](https://github.com/<link_to_line_of_code>), which tries to find a group's next dispatchable task, marks all task group tasks as [dispatched](https://github.com/<link_to_line_of_code>) in memory as it iterates over them, and tries to [delete](https://github.com/<link_to_line_of_code>) the group from memory if it reaches the final group task. 
+
+However, if the function concludes its loop without finding any dispatchable tasks, it will return without deleting the task group from memory. This means that if an entire task group is unable to run because no tasks have their dependencies met, a next_task request will mark all tasks as dispatched in memory, but none of them will be actually dispatched, and then subsequent requests will loop over the same task group tasks, also skipping over them. If a large number of task group tasks sits at the front of a queue, this can quickly become an issue, because each next_task operation will loop over a large number of undispatchable task group tasks, running a host aggregation on each iteration which adds up.
+
+### Change
+
+I did the following:
+- Add a new field to task queue items that caches whether the item's dependencies were met at the time the task queue was refreshed
+- When iterating over task queue items, skip the item if:
+  -  It is a standalone task and has `DependenciesMet` set
+  - It is a task group task and _all_ tasks in its group have `DependenciesMet` set. This will prevent us from needlessly trying to iterate through a task group.  This should be fine because task queues, and by extension the `DependenciesMet` field, refresh every 15 seconds.
+- Add various temporary debug statements to monitor post-deploy for when tasks get skipped over for dispatching due to not being ready, or having already been dispatched by another app server.
+
+### Testing
+I was able to port one of these large problematic versions from prod over to staging, and reliably reproduce the extreme slowness in staging ([honeycomb](https://ui.honeycomb.io/my_dashboard)). Deployed these changes and confirmed that latency had improved a lot.
+
+[Running the full version with the change
+](https://ui.honeycomb.io/my_dashboard)
+
+[Running the full version without the change](https://ui.honeycomb.io/my_dashboard)
+
+
+PR 2
+### Description
+There was an issue in the previous PR where SHTG tasks were incorrectly skipped for dispatch because their cached `DependenciesMet` field (which refreshes only every 15 seconds) was still false, even though their preceding group task just completed, thereby completing its dependencies. This led to those tasks getting skipped and the host picking up another task, and as a result the SHTG in question incorrectly prematurely ran its teardown group, because the host thought the group was done. This PR is a re-staging of the changes from #8428 with the following additional fixes:
+
+-  Change `getTaskGroup` to return **both** `ok` and `hasDispatchableTask`. This is so we can keep the logic for when a host just ran a task group and is requesting another task unchanged, since that logic does not contribute significantly to the slow latency issue described in the previous PR.
+- Move the marking of a TG task as dispatched [here](https://github.com/<link_to_line_of_code>), because there is a failure mode for SHTG tasks that are last in their group: they get marked dispatched, but if [this code](https://github.com/<link_to_line_of_code>) hits, the group will not be deleted from memory. This makes the task inaccessible for all subsequent requests on that app server (because it will be [skipped](https://github.com/<link_to_line_of_code>)) until the cache refreshes.
+
+### Testing
+I re-performed the testing section from #8428 to confirm that I can reproduce slow latency from a large dummy MMS version on HEAD, and that the super high latency was gone with these changes.
+
+Additionally, I configured a [patch](https://ci-system.com/version/<somehash>) to run ~350 SHTG tasks on the same distro, and added logging to determine if the setup group was incorrectly run by tasks that were not the first in their group. Interestingly, even on our current HEAD, [several tasks](https://splunkcloud.com/<my_results>) incorrectly ran their setup group out of order, signifying that TG dispatching is vulnerable to races currently.
+
+I re-deployed the changes from #8428 and confirmed it significantly [exacerbated](https://splunkcloud.com/<my_results>) the issue of tasks running their setup group out of order which would explain why it had to be reverted.
+
+Finally, with the changes in this PR, I confirmed that there were no results in Splunk for tasks running setup group out of order, so (hopefully) this PR will not just fix the issue that required #8428 to revert, but will also generally make TG dispatching more resilient to races.
+
+
+
